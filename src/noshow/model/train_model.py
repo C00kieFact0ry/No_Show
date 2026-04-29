@@ -14,11 +14,14 @@ from sklearn.calibration import CalibrationDisplay
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import (
     average_precision_score,
+    matthews_corrcoef,
     confusion_matrix,
     make_scorer,
-    matthews_corrcoef,
     recall_score,
     roc_auc_score,
+    f1_score,
+    precision_score,
+    log_loss,
 )
 from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold, train_test_split
 
@@ -26,6 +29,34 @@ from noshow.config import setup_root_logger
 
 logger = logging.getLogger(__name__)
 
+
+
+def pr_auc_metric(
+    X_val, y_val, estimator, labels,
+    X_train, y_train,
+    weight_val=None, weight_train=None,
+    *args, **kwargs,
+):
+    """FLAML custom metric: optimize on PR-AUC, also report ROC-AUC, sensitivity,
+    specificity, MCC, F1, precision at threshold 0.5."""
+    proba = estimator.predict_proba(X_val)[:, 1]
+    pred = (proba >= 0.5).astype(int)
+
+    pr_auc = average_precision_score(y_val, proba)
+
+    metrics_to_log = {
+        "pr_auc": pr_auc,
+        "roc_auc": roc_auc_score(y_val, proba),
+        "sensitivity": recall_score(y_val, pred, pos_label=1, zero_division=0),
+        "specificity": recall_score(y_val, pred, pos_label=0, zero_division=0),
+        "precision": precision_score(y_val, pred, zero_division=0),
+        "f1": f1_score(y_val, pred, zero_division=0),
+        "mcc": matthews_corrcoef(y_val, pred),
+        "log_loss": log_loss(y_val, proba, labels=labels),
+    }
+
+    # FLAML minimises the first return value -> 1 - PR-AUC
+    return 1 - pr_auc, metrics_to_log
 
 def train_cv_model(
     featuretable: pd.DataFrame,
@@ -57,8 +88,11 @@ def train_cv_model(
     """
 
     if save_exp:
-        mlflow.set_experiment("Periodic Retraining")
-        mlflow.autolog(log_models=False)
+        mlflow.set_experiment("HPO")
+        if use_automl:
+            mlflow.autolog(disable=True)
+        else:
+            mlflow.autolog(log_models=False)
 
         if os.getenv("MLFLOW_TRACKING_URI") is None:
             logger.warning(
@@ -86,25 +120,34 @@ def train_cv_model(
         logger.info(
             "Running FLAML AutoML (time budget=%ds)...", automl_time_budget
         )
+
+        # Assumed class imbalance: 10% no_show (class 1) / 90% show (class 0).
+        CLASS_WEIGHTS = {0: 1.0, 1: 9.0}
+        sample_weight_train = np.where(y_train == 1, CLASS_WEIGHTS[1], CLASS_WEIGHTS[0])
         automl = AutoML()
         automl.fit(
             X_train=X_train,
             y_train=y_train,
             task="classification",
-            metric="ap",  # average precision = PR-AUC, robust to imbalance
+            # TODO: This doesn't show all metrics in mlflow properly
+            metric=pr_auc_metric,
+            # metric="ap",
             time_budget=automl_time_budget,
             estimator_list=[
                 "lgbm",
                 "xgboost",
                 "rf",
-                "extra_tree",
-                "histgb",
+                # "extra_tree",
+                # "histgb",
                 "lrl1",
             ],
             eval_method="cv",
             n_splits=5,
             split_type="group",
             groups=train_groups,
+            mlflow_logging=True,
+            mlflow_exp_name="HPO",
+            sample_weight=sample_weight_train,
             seed=0,
             verbose=2,
             log_file_name=str(Path(output_path) / "flaml.log"),
@@ -144,7 +187,7 @@ def train_cv_model(
         grid.fit(X_train, y_train, groups=train_groups)
         best_estimator = grid.best_estimator_
 
-    # --- Test-set evaluation (shared by both branches) ---
+    # --- Test-set evaluation
     y_pred_proba = best_estimator.predict_proba(X_test)[:, 1]  # type: ignore
     y_pred_class = best_estimator.predict(X_test)  # type: ignore
 
