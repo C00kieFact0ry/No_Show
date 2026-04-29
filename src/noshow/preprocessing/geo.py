@@ -4,11 +4,10 @@ from math import atan2, cos, radians, sin, sqrt
 def haversine_distance(
     lat1: float,
     lon1: float,
-    lat2: float = 52.08593762444437,
-    lon2: float = 5.179600848939784,
+    lat2: float = 52.0554372786544,
+    lon2: float = 4.264014417004508,
 ) -> float:
     """Calculate Haversine distance
-
     Default second location is the location of the UMCU
 
     Parameters
