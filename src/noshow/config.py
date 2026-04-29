@@ -87,15 +87,15 @@ def load_config(config_path: Path) -> ProjectConfig:
         feature_building=FeatureBuildingConfig(),
         dashboard=DashboardConfig(),
         clinic={
-            "revalidatie_en_sport": ClinicConfig(
-                include_rct=True,
-                phone_number="58831",
-                teleq_name="Sport en Revalidatie",
-                main_agenda_codes=["ZH0307", "ZH0435"],
-                subagenda_exclude=True,
-                subagendas=[],
+            "oogheelkunde": ClinicConfig(
+                include_rct=False,
+                phone_number="",  # fill in if/when you wire up calling
+                teleq_name="Oogheelkunde",
+                main_agenda_codes=["CSA015"],  # the only hoofdagenda_id in your CSV
+                subagenda_exclude=False,
+                subagendas=[],  # empty = no subagenda filter
                 appcode_exclude=False,
-                appcodes=["CF15", "CF30"],
+                appcodes=[],  # empty = no appcode filter
             )
         },
     )

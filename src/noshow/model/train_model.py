@@ -5,13 +5,21 @@ from pathlib import Path
 from typing import Dict, Union
 
 import mlflow
+import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from matplotlib import pyplot as plt
 from sklearn.base import BaseEstimator
 from sklearn.calibration import CalibrationDisplay
 from sklearn.ensemble import HistGradientBoostingClassifier
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import (
+    average_precision_score,
+    confusion_matrix,
+    make_scorer,
+    matthews_corrcoef,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import GridSearchCV, StratifiedGroupKFold, train_test_split
 
 from noshow.config import setup_root_logger
@@ -25,21 +33,27 @@ def train_cv_model(
     classifier: BaseEstimator,
     param_grid: Dict,
     save_exp: bool = True,
+    use_automl: bool = False,
+    automl_time_budget: int = 600,
 ) -> None:
-    """Use Cross validation to train a model and save results and parameters to mlflow
+    """Use Cross validation to train a model and save results and parameters to mlflow.
 
     Parameters
     ----------
     featuretable : pd.DataFrame
         The featuretable
     output_path : Union[Path, str]
-        Path to the output folder where to store the dvc results
+        Path to the output folder where to store the model pickle
     classifier : BaseEstimator
-        The classifier to use
+        The classifier to use (only used in the GridSearchCV branch)
     param_grid : Dict
-        The parameter grid to search for the best model
+        The parameter grid to search for the best model (GridSearchCV branch)
     save_exp : bool
         If we want to save the experiment to MLFlow, by default True
+    use_automl : bool
+        If True, use FLAML AutoML instead of GridSearchCV, by default False
+    automl_time_budget : int
+        Time budget in seconds for FLAML AutoML, by default 600
     """
 
     if save_exp:
@@ -63,28 +77,88 @@ def train_cv_model(
         X, y, test_size=0.2, random_state=0, shuffle=False
     )
 
-    train_groups = X_train.index.get_level_values("pseudo_id")
+    # train_groups = X_train.index.get_level_values("pseudo_id")
+    train_groups = np.asarray(X_train.index.get_level_values("pseudo_id"))
 
-    cv = StratifiedGroupKFold()
+    if use_automl:
+        from flaml import AutoML
 
-    # Train the pipeline on the training data
-    grid = GridSearchCV(
-        classifier,
-        param_grid=param_grid,
-        cv=cv,
-        scoring=["roc_auc", "precision", "recall"],
-        verbose=2,
-        refit="roc_auc",
-        n_jobs=5,
-    )
-    grid.fit(X_train, y_train, groups=train_groups)
+        logger.info(
+            "Running FLAML AutoML (time budget=%ds)...", automl_time_budget
+        )
+        automl = AutoML()
+        automl.fit(
+            X_train=X_train,
+            y_train=y_train,
+            task="classification",
+            metric="ap",  # average precision = PR-AUC, robust to imbalance
+            time_budget=automl_time_budget,
+            estimator_list=[
+                "lgbm",
+                "xgboost",
+                "rf",
+                "extra_tree",
+                "histgb",
+                "lrl1",
+            ],
+            eval_method="cv",
+            n_splits=5,
+            split_type="group",
+            groups=train_groups,
+            seed=0,
+            verbose=2,
+            log_file_name=str(Path(output_path) / "flaml.log"),
+        )
+        best_estimator = automl.model.estimator
 
-    y_pred = grid.best_estimator_.predict_proba(X_test)  # type: ignore
-    test_roc_auc = roc_auc_score(y_test, y_pred[:, 1])
+        if save_exp and mlflow.active_run():
+            mlflow.log_params(
+                {
+                    "automl_best_estimator": automl.best_estimator,
+                    "automl_best_config": automl.best_config,
+                    "automl_time_budget": automl_time_budget,
+                }
+            )
+    else:
+        cv = StratifiedGroupKFold()
+        # Specificity = recall of the negative class
+        specificity_scorer = make_scorer(recall_score, pos_label=0)
+
+        scoring = {
+            "pr_auc": "average_precision",  # PR-AUC, robust to imbalance
+            "precision": "precision",  # PPV at threshold 0.5
+            "recall": "recall",  # sensitivity at 0.5
+            "specificity": specificity_scorer,
+            "f1": "f1",
+            "mcc": "matthews_corrcoef",
+        }
+        grid = GridSearchCV(
+            classifier,
+            param_grid=param_grid,
+            cv=cv,
+            scoring=scoring,
+            verbose=2,
+            refit="pr_auc",
+            n_jobs=10,
+        )
+        grid.fit(X_train, y_train, groups=train_groups)
+        best_estimator = grid.best_estimator_
+
+    # --- Test-set evaluation (shared by both branches) ---
+    y_pred_proba = best_estimator.predict_proba(X_test)[:, 1]  # type: ignore
+    y_pred_class = best_estimator.predict(X_test)  # type: ignore
+
+    test_roc_auc = roc_auc_score(y_test, y_pred_proba)
+    test_pr_auc = average_precision_score(y_test, y_pred_proba)
+
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred_class).ravel()
+    test_sensitivity = tp / (tp + fn) if (tp + fn) else 0.0
+    test_specificity = tn / (tn + fp) if (tn + fp) else 0.0
+    test_mcc = matthews_corrcoef(y_test, y_pred_class)
 
     # Create and log calibration curve
     fig, ax = plt.subplots(figsize=(10, 6))
-    CalibrationDisplay.from_predictions(y_test, y_pred[:, 1], n_bins=10, ax=ax)
+    CalibrationDisplay.from_predictions(y_test, y_pred_proba, n_bins=10, ax=ax)
     ax.set_title("Calibration Curve")
     ax.set_xlabel("Mean Predicted Probability")
     ax.set_ylabel("Fraction of Positives")
@@ -92,17 +166,25 @@ def train_cv_model(
 
     if save_exp and mlflow.active_run():
         mlflow.log_metric("test_roc_auc", float(test_roc_auc))
+        mlflow.log_metric("test_pr_auc", float(test_pr_auc))
+        mlflow.log_metric("test_sensitivity", float(test_sensitivity))
+        mlflow.log_metric("test_specificity", float(test_specificity))
+        mlflow.log_metric("test_mcc", float(test_mcc))
         mlflow.log_figure(fig, "calibration_curve.png")
     elif save_exp:
         logger.info("Mlflow run not active, re-activating run to log custom metrics.")
         with mlflow.start_run(run_id=run_id):
             mlflow.log_metric("test_roc_auc", float(test_roc_auc))
+            mlflow.log_metric("test_pr_auc", float(test_pr_auc))
+            mlflow.log_metric("test_sensitivity", float(test_sensitivity))
+            mlflow.log_metric("test_specificity", float(test_specificity))
+            mlflow.log_metric("test_mcc", float(test_mcc))
             mlflow.log_figure(fig, "calibration_curve.png")
 
-    model_path = Path(output_path) / "no_show_model_cv.pickle"
-    with model_path.open("wb") as f:
-        pickle.dump(grid.best_estimator_, f)
-    logger.info(f"Model saved to {model_path}")
+    # Save the trained model (same convention as before)
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    with open(Path(output_path) / "no_show_model_cv.pickle", "wb") as f:
+        pickle.dump(best_estimator, f)
 
 
 if __name__ == "__main__":
@@ -124,4 +206,5 @@ if __name__ == "__main__":
             "max_iter": [200, 300, 500],
             "learning_rate": [0.01, 0.05, 0.1],
         },
+        use_automl=False,
     )

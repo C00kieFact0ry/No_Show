@@ -6,7 +6,10 @@ rsconnect-python/
 
 # Editor files
 .vscode
+.idea
 
+*.zip
+mlruns/
 # Data files
 *.parquet
 *.pickle

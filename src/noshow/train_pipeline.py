@@ -20,10 +20,14 @@ from noshow.preprocessing.load_data import (
 
 logger = logging.getLogger(__name__)
 
-
 @click.command()
 @click.option("--skip-export", is_flag=True, help="Skip data export from the database.")
-def train_pipeline(skip_export: bool) -> None:
+@click.option(
+    "--use-automl",
+    is_flag=True,
+    help="Use FLAML AutoML instead of GridSearchCV for model selection.",
+)
+def train_pipeline(skip_export: bool, use_automl: bool) -> None:
     """Main function to run the training pipeline for the no-show model."""
     load_dotenv(override=True)
     setup_root_logger()
@@ -61,6 +65,7 @@ def train_pipeline(skip_export: bool) -> None:
             "max_iter": [200, 300, 500],
             "learning_rate": [0.01, 0.05, 0.1],
         },
+        use_automl=use_automl,
     )
 
 
